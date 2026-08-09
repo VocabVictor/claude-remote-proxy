@@ -3,15 +3,21 @@
 ## Data and terminal flow
 
 ```text
-local project ──rsync──────────────▶ remote project
-local session ──rsync + chown──────▶ remote user's ~/.claude/projects/<key>
-local terminal ◀──persistent SSH──▶ su - REMOTE_USER ──▶ claude
+local project ──first-run rsync─────────▶ remote project
+local session ──one-time import─────────▶ remote ~/.claude/projects/<key>
+local terminal ◀──persistent SSH/PTTY──▶ remote tmux ──▶ one Claude process
 ```
 
 The file-copy commands and the interactive PTY are SSH channels multiplexed
 over one ControlMaster connection. `ssh -tt` is important: without a PTY,
 Claude Code does not behave like the local terminal UI and prompts cannot be
-relayed faithfully.
+relayed faithfully. Server-alive messages keep the master healthy while it is
+idle.
+
+tmux is a second, separate persistence layer on the remote machine. The tmux
+server owns Claude, not the SSH client. Re-running the proxy attaches to the
+named tmux session; it does not execute another Claude command. This remains
+true even when a dropped network connection requires a new SSH transport.
 
 ## The remote user matters
 
@@ -51,19 +57,29 @@ claude-remote-proxy encode-path /home/dev_user/work/my_app
 ## Session handoff
 
 The JSONL conversation is copied from the matching local Claude project
-directory to the remote one. Project memory is copied when present. Claude is
-started with:
+directory to the remote one only during initialization. Project memory is also
+imported once. The proxy writes the chosen UUID to:
 
 ```text
---resume <session-id> --fork-session
+~/.claude/remote-proxy/<tmux-name>.session-id
 ```
 
-Forking is intentional: the remote continuation receives the imported context
-without making the copied local session the sole mutable history.
+That state file prevents a later local sync from replacing the remote JSONL,
+which may already contain newer turns. Claude is initially started with:
 
-If the resumed conversation is large, Claude may offer or automatically run
-`/compact`. That is Claude's own context-management operation; the proxy only
-relays its screen updates.
+```text
+--resume <session-id>
+```
+
+`--fork-session` is deliberately not used. Claude documents that flag as
+creating a new session ID when resuming—the opposite of a persistent proxy.
+While tmux is alive, reconnecting does not run even the `--resume` command; it
+only attaches to the process already holding that conversation.
+
+If the initial imported conversation is large, Claude may offer or
+automatically run `/compact`. That is Claude's own context-management
+operation; the proxy only relays its screen updates. It is not repeated merely
+because the local SSH client reconnects.
 
 ## Authentication and trust
 
@@ -77,6 +93,20 @@ The proxy treats both as human-controlled boundaries:
 The configured permission mode only determines whether the documented
 `--dangerously-skip-permissions` launch flag is present. Any subsequent prompt
 is shown directly to the local operator.
+
+## Reconnect versus restart
+
+These two operations are intentionally different:
+
+- **Reconnect:** `start` or `run` finds the named tmux session and attaches.
+  Claude is still the same process and session; nothing is resumed or synced.
+- **Restart:** Claude was explicitly exited, tmux ended, or the host rebooted.
+  The proxy launches Claude again with the persisted UUID and no fork. A Claude
+  resume/compaction choice may be legitimate in this case because the process
+  really did restart.
+
+An explicit `sync` is refused while the tmux session is running. This avoids
+overwriting files underneath an active agent.
 
 ## Troubleshooting
 
@@ -94,6 +124,13 @@ Check all four values together:
 2. the JSONL is below that user's home;
 3. the project key is encoded from the remote absolute path;
 4. the JSONL filename is `<session-id>.jsonl`.
+
+### Every reconnect starts a new conversation
+
+Run `status` and confirm that `remote tmux` says `running; next start will
+attach`. Also confirm the launch command contains no `--fork-session`. If tmux
+is absent, install it on the remote host; SSH ControlMaster alone preserves a
+network connection, not the Claude process after a client exits.
 
 ### Claude opens but lacks tools or settings
 
