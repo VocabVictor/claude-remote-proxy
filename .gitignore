@@ -1,0 +1,3 @@
+.claude-remote-proxy.env
+.DS_Store
+*.sock

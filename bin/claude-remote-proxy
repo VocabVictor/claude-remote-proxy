@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+PROGRAM="${0##*/}"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+log() {
+  printf '[proxy] %s\n' "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: claude-remote-proxy <command>
+
+Commands:
+  connect       Open the persistent SSH control connection
+  status        Report connection and remote prerequisites (never logs in)
+  sync          Sync the workspace and the selected Claude Code session
+  run           Run remote Claude in the current terminal without syncing
+  start         status + sync + run
+  disconnect    Close the persistent SSH control connection
+  encode-path   Print Claude Code's project-directory key for a path
+  version       Print the version
+
+Configuration is loaded from .claude-remote-proxy.env in the project root.
+Copy examples/proxy.env.example from this repository to get started.
+EOF
+}
+
+encode_path() {
+  # Claude Code currently maps every non-alphanumeric/non-hyphen path byte to '-'.
+  LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g' <<<"$1"
+}
+
+single_quote() {
+  local value=${1//\'/\'"\'"\'}
+  printf "'%s'" "$value"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+validate_safe_token() {
+  local label=$1 value=$2
+  [[ $value =~ ^[A-Za-z0-9._@:-]+$ ]] || die "$label contains unsupported characters: $value"
+}
+
+validate_safe_path() {
+  local label=$1 value=$2
+  [[ $value == /* ]] || die "$label must be an absolute path: $value"
+  [[ $value =~ ^/[A-Za-z0-9._/-]+$ ]] || die "$label contains unsupported characters: $value"
+}
+
+PROJECT_DIR="${CLAUDE_PROXY_PROJECT_DIR:-$PWD}"
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd -P)"
+CONFIG_FILE="${CLAUDE_PROXY_CONFIG:-$PROJECT_DIR/.claude-remote-proxy.env}"
+
+if [[ -f $CONFIG_FILE ]]; then
+  # The config is shell syntax and must be trusted like any other project script.
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+SSH_TARGET="${SSH_TARGET:-}"
+REMOTE_USER="${REMOTE_USER:-}"
+REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-}"
+CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}"
+CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-standard}"
+SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-15m}"
+
+target_hash() {
+  printf '%s' "$SSH_TARGET" | shasum | cut -c1-12
+}
+
+configure() {
+  require_command ssh
+  require_command shasum
+  [[ -n $SSH_TARGET ]] || die "SSH_TARGET is required in $CONFIG_FILE"
+  [[ -n $REMOTE_USER ]] || die "REMOTE_USER is required in $CONFIG_FILE"
+  [[ -n $REMOTE_PROJECT_DIR ]] || die "REMOTE_PROJECT_DIR is required in $CONFIG_FILE"
+  validate_safe_token SSH_TARGET "$SSH_TARGET"
+  validate_safe_token REMOTE_USER "$REMOTE_USER"
+  validate_safe_path REMOTE_PROJECT_DIR "$REMOTE_PROJECT_DIR"
+  case "$CLAUDE_PERMISSION_MODE" in
+    standard|bypass) ;;
+    *) die "CLAUDE_PERMISSION_MODE must be 'standard' or 'bypass'" ;;
+  esac
+  CONTROL_SOCKET="${CLAUDE_PROXY_SOCKET:-/tmp/claude-proxy-${UID}-$(target_hash).sock}"
+}
+
+ssh_base() {
+  ssh -S "$CONTROL_SOCKET" "$@"
+}
+
+master_is_running() {
+  ssh -S "$CONTROL_SOCKET" -O check "$SSH_TARGET" >/dev/null 2>&1
+}
+
+connect_master() {
+  configure
+  if master_is_running; then
+    log "persistent SSH connection: already running"
+    return
+  fi
+  rm -f "$CONTROL_SOCKET"
+  log "opening persistent SSH connection to $SSH_TARGET"
+  ssh -M -S "$CONTROL_SOCKET" -o "ControlPersist=$SSH_CONTROL_PERSIST" -fN "$SSH_TARGET"
+  master_is_running || die "SSH control connection did not start"
+}
+
+remote_root() {
+  ssh_base -T "$SSH_TARGET" "$@"
+}
+
+remote_as_user() {
+  local inner=$1 user_q inner_q
+  user_q=$(single_quote "$REMOTE_USER")
+  inner_q=$(single_quote "$inner")
+  remote_root "su - $user_q -c $inner_q"
+}
+
+remote_home() {
+  local home
+  home=$(remote_root "getent passwd $(single_quote "$REMOTE_USER") | cut -d: -f6")
+  [[ -n $home ]] || die "remote user does not exist: $REMOTE_USER"
+  validate_safe_path remote_home "$home"
+  printf '%s\n' "$home"
+}
+
+status() {
+  connect_master
+  local project_state claude_path claude_version
+  project_state=$(remote_root "if test -d $(single_quote "$REMOTE_PROJECT_DIR"); then printf present; else printf missing; fi")
+  claude_path=$(remote_as_user "command -v claude || true")
+  if [[ -n $claude_path ]]; then
+    claude_version=$(remote_as_user "claude --version 2>/dev/null || true")
+  else
+    claude_version="not installed"
+  fi
+
+  cat <<EOF
+connection: connected (persistent SSH master)
+host: $SSH_TARGET
+remote user: $REMOTE_USER
+remote project: $REMOTE_PROJECT_DIR ($project_state)
+remote claude: $claude_version
+authentication: untouched; this tool never runs login
+permission mode: $CLAUDE_PERMISSION_MODE
+EOF
+}
+
+local_session_file() {
+  local local_key local_dir selected
+  local_key=$(encode_path "$PROJECT_DIR")
+  local_dir="$CLAUDE_CONFIG_DIR/projects/$local_key"
+
+  if [[ -n $CLAUDE_SESSION_ID ]]; then
+    selected="$local_dir/$CLAUDE_SESSION_ID.jsonl"
+    [[ -f $selected ]] || die "Claude session not found: $selected"
+    printf '%s\n' "$selected"
+    return
+  fi
+
+  selected=$(ls -1t "$local_dir"/*.jsonl 2>/dev/null | head -n 1 || true)
+  [[ -n $selected ]] || die "no Claude session found under $local_dir; set CLAUDE_SESSION_ID if needed"
+  printf '%s\n' "$selected"
+}
+
+prepare_remote_project() {
+  local group
+  group=$(remote_root "id -gn $(single_quote "$REMOTE_USER")")
+  remote_root "install -d -o $(single_quote "$REMOTE_USER") -g $(single_quote "$group") $(single_quote "$REMOTE_PROJECT_DIR")"
+}
+
+sync_workspace() {
+  require_command rsync
+  prepare_remote_project
+  log "syncing workspace to $SSH_TARGET:$REMOTE_PROJECT_DIR"
+  rsync -rlptDz \
+    --exclude=.claude-remote-proxy.env \
+    --exclude=.DS_Store \
+    -e "ssh -S $CONTROL_SOCKET" \
+    "$PROJECT_DIR/" "$SSH_TARGET:$REMOTE_PROJECT_DIR/"
+
+  local group
+  group=$(remote_root "id -gn $(single_quote "$REMOTE_USER")")
+  remote_root "chown -R $(single_quote "$REMOTE_USER"):$(single_quote "$group") $(single_quote "$REMOTE_PROJECT_DIR")"
+}
+
+sync_session() {
+  require_command rsync
+  local session_file session_id remote_user_home remote_key remote_dir group
+  session_file=$(local_session_file)
+  session_id=${session_file##*/}
+  session_id=${session_id%.jsonl}
+  remote_user_home=$(remote_home)
+  remote_key=$(encode_path "$REMOTE_PROJECT_DIR")
+  remote_dir="$remote_user_home/.claude/projects/$remote_key"
+  group=$(remote_root "id -gn $(single_quote "$REMOTE_USER")")
+
+  remote_root "install -d -o $(single_quote "$REMOTE_USER") -g $(single_quote "$group") $(single_quote "$remote_dir")"
+  log "syncing Claude session $session_id"
+  rsync -rlptDz -e "ssh -S $CONTROL_SOCKET" "$session_file" "$SSH_TARGET:$remote_dir/"
+
+  local local_key local_memory
+  local_key=$(encode_path "$PROJECT_DIR")
+  local_memory="$CLAUDE_CONFIG_DIR/projects/$local_key/memory"
+  if [[ -d $local_memory ]]; then
+    log "syncing Claude project memory"
+    rsync -rlptDz -e "ssh -S $CONTROL_SOCKET" "$local_memory/" "$SSH_TARGET:$remote_dir/memory/"
+  fi
+  remote_root "chown -R $(single_quote "$REMOTE_USER"):$(single_quote "$group") $(single_quote "$remote_dir")"
+  printf '%s\n' "$session_id"
+}
+
+sync_all() {
+  connect_master
+  sync_workspace
+  local session_id
+  session_id=$(sync_session)
+  log "sync complete; session: $session_id"
+}
+
+resolve_session_id() {
+  local file
+  file=$(local_session_file)
+  file=${file##*/}
+  printf '%s\n' "${file%.jsonl}"
+}
+
+run_remote() {
+  connect_master
+  local session_id inner user_q inner_q
+  session_id=$(resolve_session_id)
+  inner="cd $(single_quote "$REMOTE_PROJECT_DIR") && exec claude"
+  if [[ $CLAUDE_PERMISSION_MODE == bypass ]]; then
+    inner+=" --dangerously-skip-permissions"
+  fi
+  inner+=" --resume $(single_quote "$session_id") --fork-session"
+  user_q=$(single_quote "$REMOTE_USER")
+  inner_q=$(single_quote "$inner")
+
+  log "attaching terminal to remote Claude; all subsequent input/output is direct"
+  log "this tool will not answer login or trust prompts for you"
+  exec ssh -tt -S "$CONTROL_SOCKET" "$SSH_TARGET" "su - $user_q -c $inner_q"
+}
+
+disconnect_master() {
+  configure
+  if master_is_running; then
+    ssh -S "$CONTROL_SOCKET" -O exit "$SSH_TARGET" >/dev/null
+    log "persistent SSH connection closed"
+  else
+    log "persistent SSH connection is not running"
+  fi
+}
+
+main() {
+  local command=${1:-}
+  case "$command" in
+    connect) connect_master ;;
+    status) status ;;
+    sync) sync_all ;;
+    run) run_remote ;;
+    start)
+      status
+      sync_all
+      run_remote
+      ;;
+    disconnect) disconnect_master ;;
+    encode-path)
+      [[ $# -eq 2 ]] || die "encode-path requires exactly one path"
+      encode_path "$2"
+      ;;
+    version|--version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
+    help|--help|-h|'') usage ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"
