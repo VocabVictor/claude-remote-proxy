@@ -2,7 +2,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 PROGRAM="${0##*/}"
 
 die() {
@@ -21,10 +21,10 @@ Usage: claude-remote-proxy <command>
 Commands:
   connect       Open the persistent SSH control connection
   status        Report connection and remote prerequisites (never logs in)
-  sync          Sync the workspace and the selected Claude Code session
-  run           Run remote Claude in the current terminal without syncing
-  start         status + sync + run
-  disconnect    Close the persistent SSH control connection
+  sync          First-time import, or an explicit later workspace sync
+  run           Create once or attach to the same remote Claude process
+  start         Bootstrap if needed, otherwise attach without syncing
+  disconnect    Close SSH; the remote Claude process keeps running
   encode-path   Print Claude Code's project-directory key for a path
   version       Print the version
 
@@ -74,7 +74,7 @@ REMOTE_PROJECT_DIR="${REMOTE_PROJECT_DIR:-}"
 CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}"
 CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-standard}"
-SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-15m}"
+SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-8h}"
 
 target_hash() {
   printf '%s' "$SSH_TARGET" | shasum | cut -c1-12
@@ -93,6 +93,8 @@ configure() {
     standard|bypass) ;;
     *) die "CLAUDE_PERMISSION_MODE must be 'standard' or 'bypass'" ;;
   esac
+  REMOTE_TMUX_SESSION="${REMOTE_TMUX_SESSION:-claude-proxy-$(printf '%s' "$REMOTE_PROJECT_DIR" | shasum | cut -c1-12)}"
+  validate_safe_token REMOTE_TMUX_SESSION "$REMOTE_TMUX_SESSION"
   CONTROL_SOCKET="${CLAUDE_PROXY_SOCKET:-/tmp/claude-proxy-${UID}-$(target_hash).sock}"
 }
 
@@ -112,7 +114,11 @@ connect_master() {
   fi
   rm -f "$CONTROL_SOCKET"
   log "opening persistent SSH connection to $SSH_TARGET"
-  ssh -M -S "$CONTROL_SOCKET" -o "ControlPersist=$SSH_CONTROL_PERSIST" -fN "$SSH_TARGET"
+  ssh -M -S "$CONTROL_SOCKET" \
+    -o "ControlPersist=$SSH_CONTROL_PERSIST" \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -fN "$SSH_TARGET"
   master_is_running || die "SSH control connection did not start"
 }
 
@@ -135,15 +141,49 @@ remote_home() {
   printf '%s\n' "$home"
 }
 
+remote_state_file() {
+  printf '%s/.claude/remote-proxy/%s.session-id\n' "$(remote_home)" "$REMOTE_TMUX_SESSION"
+}
+
+remote_session_is_initialized() {
+  remote_root "test -s $(single_quote "$(remote_state_file)")"
+}
+
+remote_session_id() {
+  local state_file session_id
+  state_file=$(remote_state_file)
+  session_id=$(remote_root "test -s $(single_quote "$state_file") && cat $(single_quote "$state_file") || true")
+  [[ -n $session_id ]] || die "remote session is not initialized; run '$PROGRAM sync' first"
+  [[ $session_id =~ ^[0-9A-Fa-f-]{36}$ ]] || die "invalid remote session state in $state_file"
+  printf '%s\n' "$session_id"
+}
+
+remote_tmux_is_running() {
+  remote_as_user "tmux has-session -t $(single_quote "$REMOTE_TMUX_SESSION") 2>/dev/null"
+}
+
 status() {
   connect_master
-  local project_state claude_path claude_version
+  local project_state claude_path claude_version tmux_path process_state session_state
   project_state=$(remote_root "if test -d $(single_quote "$REMOTE_PROJECT_DIR"); then printf present; else printf missing; fi")
   claude_path=$(remote_as_user "command -v claude || true")
   if [[ -n $claude_path ]]; then
     claude_version=$(remote_as_user "claude --version 2>/dev/null || true")
   else
     claude_version="not installed"
+  fi
+  tmux_path=$(remote_as_user "command -v tmux || true")
+  if [[ -z $tmux_path ]]; then
+    process_state="tmux not installed"
+  elif remote_tmux_is_running; then
+    process_state="running; next start will attach"
+  else
+    process_state="not running"
+  fi
+  if remote_session_is_initialized; then
+    session_state=$(remote_session_id)
+  else
+    session_state="not imported"
   fi
 
   cat <<EOF
@@ -154,6 +194,8 @@ remote project: $REMOTE_PROJECT_DIR ($project_state)
 remote claude: $claude_version
 authentication: untouched; this tool never runs login
 permission mode: $CLAUDE_PERMISSION_MODE
+remote tmux: $REMOTE_TMUX_SESSION ($process_state)
+remote session: $session_state
 EOF
 }
 
@@ -197,58 +239,82 @@ sync_workspace() {
 
 sync_session() {
   require_command rsync
-  local session_file session_id remote_user_home remote_key remote_dir group
+  local session_file session_id remote_user_home remote_key remote_dir group state_dir state_file remote_jsonl
+  remote_user_home=$(remote_home)
+  state_dir="$remote_user_home/.claude/remote-proxy"
+  state_file="$state_dir/$REMOTE_TMUX_SESSION.session-id"
+
+  if remote_session_is_initialized; then
+    session_id=$(remote_session_id)
+    log "remote session already initialized: $session_id (context import skipped)"
+    printf '%s\n' "$session_id"
+    return
+  fi
+
   session_file=$(local_session_file)
   session_id=${session_file##*/}
   session_id=${session_id%.jsonl}
-  remote_user_home=$(remote_home)
+  [[ $session_id =~ ^[0-9A-Fa-f-]{36}$ ]] || die "session filename is not a UUID: $session_id"
   remote_key=$(encode_path "$REMOTE_PROJECT_DIR")
   remote_dir="$remote_user_home/.claude/projects/$remote_key"
+  remote_jsonl="$remote_dir/$session_id.jsonl"
   group=$(remote_root "id -gn $(single_quote "$REMOTE_USER")")
 
-  remote_root "install -d -o $(single_quote "$REMOTE_USER") -g $(single_quote "$group") $(single_quote "$remote_dir")"
-  log "syncing Claude session $session_id"
-  rsync -rlptDz -e "ssh -S $CONTROL_SOCKET" "$session_file" "$SSH_TARGET:$remote_dir/"
+  remote_root "install -d -o $(single_quote "$REMOTE_USER") -g $(single_quote "$group") $(single_quote "$remote_dir") $(single_quote "$state_dir")"
+  if remote_root "test -f $(single_quote "$remote_jsonl")"; then
+    log "remote JSONL already exists; preserving its newer history"
+  else
+    log "importing Claude session $session_id exactly once"
+    rsync -rlptDz -e "ssh -S $CONTROL_SOCKET" "$session_file" "$SSH_TARGET:$remote_dir/"
+  fi
 
   local local_key local_memory
   local_key=$(encode_path "$PROJECT_DIR")
   local_memory="$CLAUDE_CONFIG_DIR/projects/$local_key/memory"
   if [[ -d $local_memory ]]; then
-    log "syncing Claude project memory"
+    log "importing Claude project memory"
     rsync -rlptDz -e "ssh -S $CONTROL_SOCKET" "$local_memory/" "$SSH_TARGET:$remote_dir/memory/"
   fi
-  remote_root "chown -R $(single_quote "$REMOTE_USER"):$(single_quote "$group") $(single_quote "$remote_dir")"
+  remote_root "printf '%s\\n' $(single_quote "$session_id") > $(single_quote "$state_file") && chown -R $(single_quote "$REMOTE_USER"):$(single_quote "$group") $(single_quote "$remote_dir") $(single_quote "$state_dir")"
   printf '%s\n' "$session_id"
 }
 
 sync_all() {
   connect_master
+  if remote_tmux_is_running; then
+    die "refusing to sync over a running remote Claude process; attach to it instead"
+  fi
   sync_workspace
   local session_id
   session_id=$(sync_session)
   log "sync complete; session: $session_id"
 }
 
-resolve_session_id() {
-  local file
-  file=$(local_session_file)
-  file=${file##*/}
-  printf '%s\n' "${file%.jsonl}"
-}
-
 run_remote() {
   connect_master
-  local session_id inner user_q inner_q
-  session_id=$(resolve_session_id)
-  inner="cd $(single_quote "$REMOTE_PROJECT_DIR") && exec claude"
-  if [[ $CLAUDE_PERMISSION_MODE == bypass ]]; then
-    inner+=" --dangerously-skip-permissions"
-  fi
-  inner+=" --resume $(single_quote "$session_id") --fork-session"
-  user_q=$(single_quote "$REMOTE_USER")
-  inner_q=$(single_quote "$inner")
+  local session_id claude_inner tmux_inner user_q inner_q tmux_path
+  tmux_path=$(remote_as_user "command -v tmux || true")
+  [[ -n $tmux_path ]] || die "tmux is required on the remote machine to preserve one Claude process"
+  session_id=$(remote_session_id)
 
-  log "attaching terminal to remote Claude; all subsequent input/output is direct"
+  if remote_tmux_is_running; then
+    tmux_inner="exec tmux attach-session -t $(single_quote "$REMOTE_TMUX_SESSION")"
+    log "attaching to existing remote Claude process: $REMOTE_TMUX_SESSION"
+  else
+    claude_inner="cd $(single_quote "$REMOTE_PROJECT_DIR") && exec claude"
+    if [[ $CLAUDE_PERMISSION_MODE == bypass ]]; then
+      claude_inner+=" --dangerously-skip-permissions"
+    fi
+    # Reuse the imported UUID. --fork-session is intentionally forbidden: it
+    # would create a different conversation on every wrapper invocation.
+    claude_inner+=" --resume $(single_quote "$session_id")"
+    tmux_inner="exec tmux new-session -s $(single_quote "$REMOTE_TMUX_SESSION") $(single_quote "$claude_inner")"
+    log "starting the persistent remote Claude process once: $REMOTE_TMUX_SESSION"
+  fi
+  user_q=$(single_quote "$REMOTE_USER")
+  inner_q=$(single_quote "$tmux_inner")
+
+  log "terminal attached through tmux; detaching SSH does not end Claude"
   log "this tool will not answer login or trust prompts for you"
   exec ssh -tt -S "$CONTROL_SOCKET" "$SSH_TARGET" "su - $user_q -c $inner_q"
 }
@@ -272,7 +338,11 @@ main() {
     run) run_remote ;;
     start)
       status
-      sync_all
+      if remote_session_is_initialized; then
+        log "remote session already exists; skipping workspace and context sync"
+      else
+        sync_all
+      fi
       run_remote
       ;;
     disconnect) disconnect_master ;;
