@@ -1,3 +1,4 @@
 .claude-remote-proxy.env
 .DS_Store
 *.sock
+native/claude-remote-proxy-native

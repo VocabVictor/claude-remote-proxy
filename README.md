@@ -28,16 +28,57 @@ the remote host. This tool does not change the server's network settings.
 Set `REMOTE_CLAUDE_BIN` to an absolute executable path when Claude is not on
 the remote login shell's PATH.
 
+### Native fast path (Linux / WSL)
+
+Build with `make -C native`. Install `native/claude-remote-proxy-native` on
+both the client and server (build separately for different architectures).
+Use `examples/native.env.example` as the client configuration template.
+Set `REMOTE_PROXY_BIN` to the absolute server-side binary path, then run
+`native/claude-remote-proxy-native start` locally. Claude Code still executes
+in the remote project. The native client only supports remote mode.
+
+The C++17 client directly replaces itself with OpenSSH. OpenSSH automatically
+reuses or creates its control connection, without a separate connection probe.
+The remote C++ helper replaces shell bootstrap commands, hashes paths in-process,
+reads an existing UUID without locking or writing, and directly executes tmux.
+There is no Python runtime, custom forwarding loop, or additional relay daemon.
+The attached data path remains OpenSSH/tmux; this optimizes attachment overhead,
+not model generation speed or network propagation time.
+
+Use an absolute `REMOTE_CLAUDE_BIN` if the SSH non-login PATH omits Claude.
+`REMOTE_USER` is the direct SSH login user; the native helper never uses `su`.
+Config accepts plain `KEY=value` and paired quotes; it does not evaluate shell
+expansions, source scripts, or expand `~`. Environment variables override file
+values. Set `REMOTE_TMUX_SESSION` explicitly to reuse a Bash client's session;
+the native default uses a different in-process hash. `CLAUDE_PROXY_SSH_CONFIG`
+optionally selects an SSH config file. Run `disconnect` to close the master.
+
+Measured on the owner's Singapore Tencent instance (2026-10-15, Ubuntu 26.04,
+2 vCPU / 2 GB), using real loopback SSH and tmux with an already running test
+process, 20 measured warm attachments per client after one discarded warm-up:
+
+| Client | Median ready time | p95 ready time |
+| --- | ---: | ---: |
+| Bash remote mode | 68.70 ms | 71.81 ms |
+| Native C++ mode | 16.47 ms | 17.70 ms |
+
+This run reduced median attachment overhead by 52.23 ms (76%). These are
+sequential local-loopback samples, not Internet latency or Claude response
+benchmarks; machine load and SSH/shell configuration affect the result.
+
 ### Validation
 
 Run `bash tests/test.sh` and `bash tests/remote.sh` for local regression tests.
-On a disposable Linux server with SSH server, tmux, flock, Python 3 and shasum,
-run `sudo python3 tests/integration.py`. It starts a separate SSH daemon bound
+Run `make -C native && bash tests/native.sh` for native regression tests.
+On a disposable Linux server with SSH server, tmux, a C++ compiler and shasum,
+run `sudo bash tests/integration.sh`. It starts a separate SSH daemon bound
 only to loopback with temporary host/client keys and strict host verification.
 It checks initial launch, process survival after a disconnected client,
 reattachment without a duplicate process, and restart with the original UUID.
 The Claude executable is a deterministic test stand-in: no authentication or
-model calls are performed. Test processes, keys, workspace and session state
+model calls are performed. A C++ PTY harness also measures 20 warm attachments
+per client, from process launch until the tmux ready marker is displayed.
+Test processes, keys, workspace and session state
 are cleaned up; the system SSH configuration is not changed.
 
 This integration test passed on the owner's Tencent Cloud Singapore instance
