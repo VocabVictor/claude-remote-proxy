@@ -10,10 +10,12 @@ state="$HOME/.claude/remote-proxy/$session.session-id"
 project="$base/project"
 key=$(printf '%s' "$project" | LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g')
 daemon=''
+proxy_pid=''
 cleanup() {
   tmux kill-session -t "$session" 2>/dev/null || :
   /usr/bin/ssh -F "$base/ssh_config" -S "$base/control.sock" -O exit test-company 2>/dev/null || :
   [[ -z $daemon ]] || { kill "$daemon" 2>/dev/null || :; wait "$daemon" 2>/dev/null || :; }
+  [[ -z $proxy_pid ]] || { kill "$proxy_pid" 2>/dev/null || :; wait "$proxy_pid" 2>/dev/null || :; }
   rm -f "$state" "$state.lock"
   rm -rf -- "$base" "$HOME/.claude/projects/$key"
 }
@@ -75,6 +77,13 @@ for ((i=0;i<100;i++)); do
 done
 env -u CLAUDE_PROXY_SOCKET "$REMOTE_PROXY_BIN" network-test
 env -u CLAUDE_PROXY_SOCKET "$REMOTE_PROXY_BIN" disconnect
+c++ -O2 -Wall -Wextra "$root/tests/http_proxy.cpp" -o "$base/http-proxy"
+"$base/http-proxy" "$base/proxy.port" &
+proxy_pid=$!
+for ((i=0;i<100;i++)); do [[ -s $base/proxy.port ]] && break; sleep .05; done
+proxy="127.0.0.1:$(cat "$base/proxy.port")"
+env -u CLAUDE_PROXY_SOCKET SSH_HTTP_PROXY="$proxy" "$REMOTE_PROXY_BIN" network-test
+env -u CLAUDE_PROXY_SOCKET SSH_HTTP_PROXY="$proxy" "$REMOTE_PROXY_BIN" disconnect
 env -u CLAUDE_PROXY_SOCKET SSH_COMPRESSION=yes SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$REMOTE_PROXY_BIN" network-test
 env -u CLAUDE_PROXY_SOCKET SSH_COMPRESSION=yes SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$REMOTE_PROXY_BIN" disconnect
 "$REMOTE_PROXY_BIN" network-test

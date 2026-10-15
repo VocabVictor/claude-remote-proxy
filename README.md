@@ -33,6 +33,9 @@ the remote login shell's PATH.
 Build with `make -C native`. Install `native/claude-remote-proxy-native` on
 both the client and server (build separately for different architectures).
 Use `examples/native.env.example` as the client configuration template.
+The example selects a low-latency preset requiring OpenSSH 9.5+: no compression
+or keystroke-timing masking. This exposes typing timing; remove that override
+to retain OpenSSH's masking behavior. Existing configurations are not rewritten.
 Set `REMOTE_PROXY_BIN` to the absolute server-side binary path, then run
 `native/claude-remote-proxy-native start` locally. Claude Code still executes
 in the remote project. The native client only supports remote mode.
@@ -56,6 +59,9 @@ optionally selects an SSH config file. Run `disconnect` to close the master.
 Network tuning and measurement are documented in [performance notes](docs/performance.md).
 `native/claude-remote-proxy-native network-test` measures 50 request/reply
 round trips through authenticated SSH, without starting Claude or tmux.
+If measured faster, set `SSH_HTTP_PROXY=http://127.0.0.1:1080` to use a local
+HTTP CONNECT proxy. A short-lived C++ helper passes the socket to OpenSSH;
+there is no extra application forwarding loop. See the performance notes.
 
 Measured on the owner's Singapore Tencent instance (2026-10-15, Ubuntu 26.04,
 2 vCPU / 2 GB), using real loopback SSH and tmux with an already running test
@@ -84,6 +90,10 @@ model calls are performed. A C++ PTY harness also measures 20 warm attachments
 per client, from process launch until the tmux ready marker is displayed.
 Test processes, keys, workspace and session state
 are cleaned up; the system SSH configuration is not changed.
+
+For controlled input-latency and bulk-transfer contention experiments, run
+`sudo bash tests/network.sh` on a disposable Linux host. It shapes only its
+own temporary network namespaces; see the performance notes for results.
 
 This integration test passed on the owner's Tencent Cloud Singapore instance
 (Ubuntu Server 26.04, 2 vCPU / 2 GB). This validates SSH/tmux session lifecycle,

@@ -37,6 +37,7 @@ Optional config values map directly to OpenSSH options:
 | `SSH_IP_QOS=none` | Test paths that handle DSCP traffic marking poorly. |
 | `SSH_CIPHERS=aes128-gcm@openssh.com` | Compare with `chacha20-poly1305@openssh.com` on the actual CPU. |
 | `SSH_OBSCURE_KEYSTROKE_TIMING=no` | Disable interactive timing masking on OpenSSH 9.5+. |
+| `SSH_HTTP_PROXY=http://127.0.0.1:1080` | Use a measured HTTP CONNECT route with OpenSSH socket passing. |
 
 Unset values inherit the user's SSH configuration. Cipher availability is
 checked by OpenSSH. No weak cipher or host-key-verification bypass is added.
@@ -79,3 +80,109 @@ actual route, then investigate queueing, route choice, MTU and retransmits.
 Changing BBR, buffers or MTU without that evidence can fail to help or worsen
 interactive latency. Model API keep-alive/streaming requires inspecting the
 actual API proxy; this repository does not intercept those requests.
+
+## Controlled interactive-input experiment
+
+Run `sudo bash tests/network.sh` on a disposable Linux server with a C++
+compiler, OpenSSH server, iproute2, network namespaces and netem support.
+The test creates its own client/server namespaces, veth pair, temporary SSH
+keys and daemon. Shaping is confined to those namespaces. Production eth0,
+global sysctls, SSH configuration and firewall are untouched; test namespaces
+and processes are removed afterwards. It can take a few minutes under load.
+
+A C++ PTY driver sends one byte and waits for its remote echo, discarding one
+warm-up and recording 20 round trips per case. Both ends use a real SSH TTY;
+the remote helper puts it into raw mode. This exercises interactive input
+scheduling, unlike the non-TTY `network-test`. No Claude/model calls occur.
+
+One run on the same Singapore server (OpenSSH 10.2p1, 2026-10-15):
+
+| Scenario | p50 input echo | p95 input echo |
+| --- | ---: | ---: |
+| Unshaped veth, timing masking enabled | 20.50 ms | 20.95 ms |
+| Unshaped veth, timing masking disabled | 0.15 ms | 0.19 ms |
+| 40 ms base RTT / 5 Mbit/s, FIFO, idle | 40.71 ms | 40.83 ms |
+| Same shaped link, 64 MiB bulk transfer sharing SSH master | 3514.72 ms | 3514.86 ms |
+| Same shaped FIFO, bulk and terminal on separate masters | 201.21 ms | 302.97 ms |
+| Same shaped link with fq_codel below netem, separate masters | 390.17 ms | 792.33 ms |
+
+The example config now explicitly disables timing masking and compression
+for a low-latency preset (OpenSSH 9.5+). Core defaults still inherit existing
+SSH configuration. In this local experiment, disabling masking removed about
+20.35 ms of input scheduling delay. That result is separate from attachment
+time and does not imply the same reduction on every Internet route.
+
+Sharing a transport with the bulk transfer was markedly worse here. The
+native client's default dedicated socket should therefore stay dedicated to
+terminals; bulk transfers and model API tunnels should use other transports.
+Separate transports still contend for link capacity, as the 201 ms result
+shows. The fq_codel/netem arrangement performed worse in this run; it was not
+applied to the live server. This is one controlled, sequential 20-sample run,
+not a general congestion-control ranking or a measurement of the user's
+company network.
+
+## HTTP CONNECT without an application relay loop
+
+Set `SSH_HTTP_PROXY=http://127.0.0.1:1080` only when that proxy is reachable
+from the Linux/WSL client and performs better on the intended route. A plain
+`host:port` or bracketed IPv6 `[::1]:1080` is also accepted. Authentication,
+HTTPS proxy URLs and URL paths are not supported. Credentials are not read
+from browser, proxy or account files.
+
+The native bootstrap connects to the HTTP proxy, issues CONNECT, reads only
+the response headers, and transfers the connected descriptor to OpenSSH via
+SCM_RIGHTS (`ProxyUseFdpass=yes`). It then exits. OpenSSH owns the encrypted
+transport thereafter; no Python/socat/netcat or native copying loop is added
+to terminal traffic. SSH authentication, encryption and strict host-key
+verification still apply. The proxy setting creates its own default master
+socket profile. If a socket is explicitly overridden, disconnect first when
+changing routes. Do not combine this override with a required ProxyJump.
+
+The integration suite starts a loopback-only C++ CONNECT fixture and verifies
+real authenticated SSH echo through this path, including host-key validation.
+
+For route diagnosis, build `tests/route.cpp` as a standalone tool. Default
+`target port [proxy-host proxy-port]` measures TCP connection plus SSH banner
+arrival with no authentication. This does not measure steady-state RTT and
+repeated unauthenticated connections can trigger SSH rate limits. `--echo`
+before these arguments measures 10 byte round trips over one connection to
+the matching temporary echo service. `--serve PORT` binds that echo service
+to loopback for at most 120 seconds; `--serve-public PORT` explicitly binds
+all IPv4 interfaces. It only echoes bounded input, with no commands or file
+access, and should be used for a controlled diagnostic then stopped.
+
+## Actual Windows/WSL to Singapore SSH results
+
+An additional time-limited SSH daemon on the owner's Singapore server was
+used to compare the real Internet paths. It used a separate temporary host
+key and client public key, strict client host-key verification, and no model
+calls. No production SSH config or authorized_keys file was changed. The
+server/test keys and local private test key were removed after the experiment.
+
+Each row below is a complete 50-echo authenticated `network-test` run. Routes
+were also rechecked in reverse order. These are consecutive byte echoes on
+an established encrypted SSH connection, excluding handshake time and tmux.
+
+| Run / route | p50 RTT | p95 RTT | Maximum |
+| --- | ---: | ---: | ---: |
+| 1 / direct | 117.20 ms | 2895.14 ms | 6464.46 ms |
+| 1 / HTTP proxy 1080 | 154.03 ms | 165.35 ms | 171.16 ms |
+| 1 / HTTP proxy 1082 | 171.79 ms | 178.49 ms | 494.13 ms |
+| 2 / HTTP proxy 1080 | 184.55 ms | 213.31 ms | 258.91 ms |
+| 2 / direct | 120.76 ms | 589.03 ms | 1279.98 ms |
+| 2 / HTTP proxy 1080 recheck | 167.01 ms | 188.18 ms | 192.81 ms |
+
+The direct connection's Linux TCP counters reached 12 total retransmissions,
+624 retransmitted bytes, and a congestion window of two segments in the
+second run. This supports investigating transport loss/reordering/ACK delay
+rather than treating all slow responses as extra propagation distance.
+It does not establish an exact packet-loss percentage or which router is
+responsible. ICMP/traceroute non-responses alone do not establish SSH loss.
+
+For this host at this time, 1080 was the preferable low-jitter route: higher
+median latency, but much smaller tail latency than direct. The default route
+remains unchanged; select it explicitly with `SSH_HTTP_PROXY` in this target's
+config and remeasure when the network or proxy node changes. The other local
+proxy listener was not assumed to be interchangeable. Cold TCP/banner tests
+had favored direct, demonstrating why connection-setup timings cannot replace
+steady-state measurements for a long-lived terminal.

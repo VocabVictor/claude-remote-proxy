@@ -22,6 +22,11 @@ grep -qx 'IPQoS=none' "$CAPTURE"
 grep -qx 'Ciphers=aes128-gcm@openssh.com' "$CAPTURE"
 grep -qx 'ObscureKeystrokeTiming=no' "$CAPTURE"
 if SSH_COMPRESSION=invalid "$binary" start 2>/dev/null; then exit 1; fi
+SSH_HTTP_PROXY=http://127.0.0.1:1080 "$binary" start
+grep -qx 'ProxyUseFdpass=yes' "$CAPTURE"
+grep -q -- --http-connect "$CAPTURE"
+if SSH_HTTP_PROXY=http://user:password@127.0.0.1:1080 "$binary" start 2>/dev/null; then exit 1; fi
+if SSH_HTTP_PROXY=127.0.0.1:0 "$binary" start 2>/dev/null; then exit 1; fi
 [[ $(printf 'echo-test' | "$binary" --echo) == echo-test ]]
 env -u CLAUDE_PROXY_SOCKET HOME="$base" SSH_COMPRESSION=no "$binary" start
 socket1=$(sed -n '2p' "$CAPTURE")

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -24,10 +25,18 @@ int main(int argc, char** argv) {
    if (getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length)) throw std::runtime_error("getsockname");
    std::cout << ntohs(address.sin_port) << '\n'; close(fd); return 0;
   }
-  if (argc < 3) throw std::runtime_error("expected --drop|--bench command [args]");
+  if (argc < 3) throw std::runtime_error("expected --drop|--bench|--rtt command [args]");
   bool drop = std::string(argv[1]) == "--drop";
+  bool rtt = std::string(argv[1]) == "--rtt";
+  int rtt_samples = 50;
+  if (const char* configured = std::getenv("CCPROXY_RTT_SAMPLES")) {
+   std::string count = configured; size_t used;
+   rtt_samples = std::stoi(count, &used);
+   if (used != count.size() || rtt_samples < 2 || rtt_samples > 1000) throw std::runtime_error("invalid RTT sample count");
+  }
+  if (!drop && !rtt && std::string(argv[1]) != "--bench") throw std::runtime_error("unknown test mode");
   std::vector<double> samples;
-  for (int i = 0; i < (drop ? 1 : 21); ++i) {
+  for (int i = 0; i < (drop || rtt ? 1 : 21); ++i) {
    int terminal;
    winsize size{40, 160, 0, 0};
    auto start = std::chrono::steady_clock::now();
@@ -52,7 +61,20 @@ int main(int argc, char** argv) {
     kill(child, SIGKILL); waitpid(child, nullptr, 0); close(terminal);
     throw std::runtime_error("ready marker missing: " + output);
    }
-   if (drop) { kill(child, SIGHUP); close(terminal); }
+   if (rtt) {
+    for (int sample = 0; sample <= rtt_samples; ++sample) {
+     char sent = static_cast<char>(33 + sample), received = 0;
+     auto before = std::chrono::steady_clock::now();
+     pollfd descriptor{terminal, POLLIN, 0};
+     if (write(terminal, &sent, 1) != 1 || poll(&descriptor, 1, 10000) <= 0 ||
+         read(terminal, &received, 1) != 1 || received != sent) {
+      kill(child, SIGKILL); close(terminal); waitpid(child, nullptr, 0);
+      throw std::runtime_error("interactive echo failed");
+     }
+     if (sample) samples.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count());
+    }
+   }
+   if (drop || rtt) { kill(child, SIGHUP); close(terminal); }
    else {
     if (write(terminal, "\002d", 2) != 2) throw std::runtime_error("detach write");
     // Drain until EOF; otherwise a full PTY buffer could block SSH exit.
@@ -60,10 +82,14 @@ int main(int argc, char** argv) {
     close(terminal);
    }
    int status; while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-   if (!drop && (!WIFEXITED(status) || WEXITSTATUS(status))) throw std::runtime_error("attach failed");
-   if (i) samples.push_back(ms); // discard first attach (warm-up)
+   if (!drop && !rtt && (!WIFEXITED(status) || WEXITSTATUS(status))) throw std::runtime_error("attach failed");
+   if (i && !rtt) samples.push_back(ms); // discard first attach (warm-up)
   }
-  if (!drop) {
+  if (rtt) {
+   std::sort(samples.begin(), samples.end());
+   std::cout << "interactive_echo: n=" << samples.size() << " p50_ms=" << (samples[(samples.size()-1)/2]+samples[samples.size()/2])/2
+             << " p95_ms=" << samples[(samples.size()*95+99)/100-1] << " max_ms=" << samples.back() << '\n';
+  } else if (!drop) {
    std::sort(samples.begin(), samples.end());
    std::cout << argv[2] << ": n=20 warm_attach p50_ms=" << (samples[9]+samples[10])/2
              << " p95_ms=" << samples[18] << '\n';

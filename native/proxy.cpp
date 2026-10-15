@@ -23,7 +23,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <termios.h>
 #include <unistd.h>
+#include "http_connect.hpp"
 
 namespace fs = std::filesystem;
 using Strings = std::vector<std::string>;
@@ -245,7 +247,18 @@ std::map<std::string, std::string> config() {
 }
 int main(int argc, char** argv) {
     try {
+        if (argc == 5 && std::string(argv[1]) == "--http-connect")
+            return http_connect_fd(argv[2], argv[3], argv[4]);
         if (argc == 2 && std::string(argv[1]) == "--echo") {
+            if (isatty(STDIN_FILENO)) {
+                termios mode{};
+                if (tcgetattr(STDIN_FILENO, &mode)) throw std::runtime_error("echo terminal read failed");
+                cfmakeraw(&mode);
+                if (tcsetattr(STDIN_FILENO, TCSANOW, &mode)) throw std::runtime_error("echo terminal setup failed");
+                const char marker[] = "TEST_CLAUDE_READY";
+                if (write(STDOUT_FILENO, marker, sizeof marker - 1) != sizeof marker - 1)
+                    throw std::runtime_error("echo terminal marker failed");
+            }
             char buffer[4096];
             for (;;) {
                 ssize_t n = read(STDIN_FILENO, buffer, sizeof buffer);
@@ -264,7 +277,7 @@ int main(int argc, char** argv) {
             serve(argv[2], argv[3], argv[4], argv[5]);
         std::string command = argc > 1 ? argv[1] : "start";
         if (command == "--version" || command == "version") {
-            std::cout << "claude-remote-proxy-native 0.3.1\n"; return 0;
+            std::cout << "claude-remote-proxy-native 0.4.0\n"; return 0;
         }
         if (command == "--help" || command == "help") {
             std::cout << "Usage: claude-remote-proxy-native [start|run|network-test|disconnect|version]\n"
@@ -294,6 +307,8 @@ int main(int argc, char** argv) {
         auto ssh_config = get("CLAUDE_PROXY_SSH_CONFIG");
         auto compression = get("SSH_COMPRESSION"), qos = get("SSH_IP_QOS"), ciphers = get("SSH_CIPHERS");
         auto obscure = get("SSH_OBSCURE_KEYSTROKE_TIMING");
+        auto proxy = get("SSH_HTTP_PROXY");
+        if (!proxy.empty()) proxy_address(proxy);
         if (!compression.empty() && compression != "yes" && compression != "no")
             throw std::runtime_error("SSH_COMPRESSION must be yes or no");
         if (!obscure.empty() && obscure != "yes" && obscure != "no")
@@ -302,7 +317,7 @@ int main(int argc, char** argv) {
             private_directory(socket_dir);
             // OpenSSH expands %C using resolved host, port, user and jump host.
             // Profile-specific masters prevent a new option silently reusing old settings.
-            socket = (socket_dir / ("%C-" + hash(ssh_config + "\n" + compression + "\n" + qos + "\n" + ciphers + "\n" + obscure).substr(0, 8))).string();
+            socket = (socket_dir / ("%C-" + hash(ssh_config + "\n" + compression + "\n" + qos + "\n" + ciphers + "\n" + obscure + "\n" + proxy).substr(0, 8))).string();
             if (socket.size() + 38 > 100) throw std::runtime_error("expanded SSH socket path too long; set CLAUDE_PROXY_SOCKET");
         }
         if (socket.size() > 100) throw std::runtime_error("SSH control socket path too long; set CLAUDE_PROXY_SOCKET");
@@ -312,6 +327,13 @@ int main(int argc, char** argv) {
         auto user = get("REMOTE_USER");
         if (!user.empty()) { args.push_back("-l"); args.push_back(user); }
         if (command == "disconnect") { args.insert(args.end(), {"-O", "exit", target}); execute(args); }
+        if (!proxy.empty()) {
+            // Escape literal percent signs before OpenSSH expands its tokens.
+            auto escape = [](const std::string& text) { std::string out; for (char c : text) { out += c; if (c == '%') out += '%'; } return out; };
+            auto executable = fs::canonical("/proc/self/exe").string();
+            args.insert(args.end(), {"-o", "ProxyUseFdpass=yes", "-o",
+                "ProxyCommand=" + quote(escape(executable)) + " --http-connect " + quote(proxy) + " '%h' '%p'"});
+        }
         if (!compression.empty()) args.insert(args.end(), {"-o", "Compression=" + compression});
         if (!qos.empty()) args.insert(args.end(), {"-o", "IPQoS=" + qos});
         if (!ciphers.empty()) args.insert(args.end(), {"-o", "Ciphers=" + ciphers});
