@@ -56,6 +56,14 @@ values. Set `REMOTE_TMUX_SESSION` explicitly to reuse a Bash client's session;
 the native default uses a different in-process hash. `CLAUDE_PROXY_SSH_CONFIG`
 optionally selects an SSH config file. Run `disconnect` to close the master.
 
+The native client defaults `SSH_OBSCURE_KEYSTROKE_TIMING=no` to avoid the
+interactive input scheduler's usual 20 ms interval; set it to `yes` to retain
+typing-timing concealment. Unsupported older SSH clients ignore this option.
+Optional `REMOTE_API_PROXY=http://host:port` configures HTTP(S) requests only
+inside a newly started remote Claude process, independently of SSH routing.
+Use `REMOTE_API_NO_PROXY` for internal/domestic endpoints. See the
+[scope and session rules](docs/performance.md#separate-terminal-and-claude-http-routing).
+
 Network tuning and measurement are documented in [performance notes](docs/performance.md).
 The [Cloudflare experiment](edge/README.md) records direct, proxy-disabled
 measurements. A [follow-up with IP selection and wstunnel](edge/wstunnel-results.md)

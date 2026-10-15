@@ -11,6 +11,63 @@ Claude must run on the company server to use its workspace. Routing its API
 traffic through Singapore does not require routing the terminal connection
 through Singapore too. Measure these paths separately before adding hops.
 
+## Separate terminal and Claude HTTP routing
+
+Native 0.5.0 adds `REMOTE_API_PROXY=http://host:port` and optional
+`REMOTE_API_NO_PROXY=comma,separated,hosts`. The address is resolved on the
+**company server**, not on your laptop or the Singapore origin. It must be
+an existing HTTP CONNECT endpoint; this setting neither creates a proxy nor
+selects its exit country. Credential-bearing URLs and paths are rejected.
+For a private Singapore exit, connect to its proxy using an authenticated,
+encrypted transport rather than exposing an unauthenticated Internet proxy.
+
+The remote native helper adds HTTP_PROXY/HTTPS_PROXY and lowercase variants
+only to the newly launched Claude process and its descendants. It leaves
+SSH routing, the tmux server's global environment, other sessions and other
+applications alone. It removes ALL_PROXY variants only in that child.
+HTTP requests made by Claude's tools can also inherit this environment:
+this is process-scoped routing, not hostname-exclusive API interception.
+Use the bypass list for company/private and domestic tool endpoints.
+
+Loopback destinations are always bypassed. If an explicit bypass list is
+provided, it replaces the non-loopback inherited list; otherwise the helper
+preserves both inherited NO_PROXY variants. Neither proxy URLs containing
+credentials nor authentication keys are needed for this configuration.
+Provider selection, models, API keys and prompt-cache settings are not changed.
+
+Existing Claude processes keep their original environment when reattached.
+The new profile takes effect only when a new Claude process starts; choose
+a separate `REMOTE_TMUX_SESSION` to compare profiles without stopping work.
+Both native endpoints must be updated before enabling these optional fields.
+With neither field set, the old remote launch protocol is preserved.
+The credential-free SSH `network-test` never routes through this API proxy.
+
+### Validation on 2026-10-16
+
+On the owner's Singapore server, the real SSH/tmux integration suite verified
+that a deliberately nonexistent API-proxy listener did not affect SSH echo,
+that only the fake Claude process received the selected proxy/bypass values,
+that reattachment did not replace the live process, and that a restarted
+process resumed the same UUID with its new proxy profile. No model call ran.
+
+A fresh isolated PTY test measured timing masking enabled at 20.10 ms median
+/ 22.28 ms p95 and disabled at 0.17 / 0.20 ms. This is a controlled local
+network test of intentional input scheduling, not an Internet RTT reduction.
+The Windows host's two company SSH aliases were inspected separately:
+OpenSSH 9.5 resolved masking to `yes` before the host-specific change and
+`no` afterwards. Compression remained `no`, multiplexing remained disabled,
+and no ProxyCommand or ProxyJump was added. Existing connections need a new
+SSH connection to pick up that configuration; they were not interrupted.
+
+The remote interactive shells and user-level Claude settings inspected did
+not expose HTTP proxy/base-URL overrides. This does not rule out project
+settings or differently launched live processes. Unauthenticated direct
+health GETs to api.anthropic.com returned HTTP 403 from both company hosts
+(0.86/1.83 s to first response in one sample each) and HTTP 404 from Singapore
+(23 ms). These are connectivity/health observations, not model first-token
+latency, account validity, or a measured end-to-end proxy improvement.
+Existing company proxy services and running Claude processes were not changed.
+
 ## Measure SSH independently
 
 Run `native/claude-remote-proxy-native network-test` with the normal config and
@@ -36,10 +93,10 @@ Optional config values map directly to OpenSSH options:
 | `SSH_COMPRESSION=yes` or `no` | Compare bandwidth savings with compression CPU/delay. |
 | `SSH_IP_QOS=none` | Test paths that handle DSCP traffic marking poorly. |
 | `SSH_CIPHERS=aes128-gcm@openssh.com` | Compare with `chacha20-poly1305@openssh.com` on the actual CPU. |
-| `SSH_OBSCURE_KEYSTROKE_TIMING=no` | Disable interactive timing masking on OpenSSH 9.5+. |
+| `SSH_OBSCURE_KEYSTROKE_TIMING=no` | Native default: disable interactive timing masking on OpenSSH 9.5+. Set `yes` to retain it. |
 | `SSH_HTTP_PROXY=http://127.0.0.1:1080` | Use a measured HTTP CONNECT route with OpenSSH socket passing. |
 
-Unset values inherit the user's SSH configuration. Cipher availability is
+Except for native timing masking (default `no`), unset values inherit the user's SSH configuration. Cipher availability is
 checked by OpenSSH. No weak cipher or host-key-verification bypass is added.
 Timing masking normally uses 20 ms packet intervals; disabling it can reduce
 intentional input scheduling delay but reveals typing timing to passive
@@ -107,8 +164,9 @@ One run on the same Singapore server (OpenSSH 10.2p1, 2026-10-15):
 | Same shaped link with fq_codel below netem, separate masters | 390.17 ms | 792.33 ms |
 
 The example config now explicitly disables timing masking and compression
-for a low-latency preset (OpenSSH 9.5+). Core defaults still inherit existing
-SSH configuration. In this local experiment, disabling masking removed about
+for a low-latency preset (OpenSSH 9.5+). The native client now also defaults
+timing masking to `no`, and uses `IgnoreUnknown` for older SSH clients.
+Other unset options still inherit SSH configuration. In this local experiment, disabling masking removed about
 20.35 ms of input scheduling delay. That result is separate from attachment
 time and does not imply the same reduction on every Internet route.
 

@@ -60,6 +60,7 @@ id=\${!#}
 mkdir -p "\$HOME/.claude/projects/$key"
 touch "\$HOME/.claude/projects/$key/\$id.jsonl"
 printf '%s %s %s\n' "\$\$" "\$1" "\$id" >> "$base/events"
+printf '%s|%s|%s|%s\n' "\$HTTPS_PROXY" "\$https_proxy" "\$NO_PROXY" "\$no_proxy" >> "$base/api-env"
 printf 'TEST_CLAUDE_READY\n'
 exec sleep infinity
 EOF
@@ -87,17 +88,25 @@ env -u CLAUDE_PROXY_SOCKET SSH_HTTP_PROXY="$proxy" "$REMOTE_PROXY_BIN" disconnec
 env -u CLAUDE_PROXY_SOCKET SSH_COMPRESSION=yes SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$REMOTE_PROXY_BIN" network-test
 env -u CLAUDE_PROXY_SOCKET SSH_COMPRESSION=yes SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$REMOTE_PROXY_BIN" disconnect
 "$REMOTE_PROXY_BIN" network-test
+export REMOTE_API_PROXY=http://127.0.0.1:1085 REMOTE_API_NO_PROXY=internal.example
+# No listener exists on 1085: this still succeeds because API routing never
+# changes the SSH transport or the credential-free echo diagnostic.
+"$REMOTE_PROXY_BIN" network-test
 "$base/terminal" --drop "$REMOTE_PROXY_BIN" start
 read -r pid flag id <"$base/events"
 [[ $flag == --session-id ]]
 tmux has-session -t "$session"
+grep -Fxq 'http://127.0.0.1:1085|http://127.0.0.1:1085|localhost,127.0.0.1,::1,internal.example|localhost,127.0.0.1,::1,internal.example' "$base/api-env"
+export REMOTE_API_PROXY=http://127.0.0.1:1086
 "$base/terminal" --drop "$REMOTE_PROXY_BIN" start
 [[ $(wc -l <"$base/events") == 1 ]]
+[[ $(wc -l <"$base/api-env") == 1 ]]
 kill -0 "$pid"
 tmux kill-session -t "$session"
 "$base/terminal" --drop "$REMOTE_PROXY_BIN" start
 read -r _ flag2 id2 < <(tail -n 1 "$base/events")
 [[ $flag2 == --resume && $id == "$id2" ]]
+tail -1 "$base/api-env" | grep -Fq 'http://127.0.0.1:1086|http://127.0.0.1:1086|'
 "$base/terminal" --bench bash "$root/bin/claude-remote-proxy" start
 "$base/terminal" --bench "$REMOTE_PROXY_BIN" start
 [[ $(wc -l <"$base/events") == 2 ]]

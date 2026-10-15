@@ -16,6 +16,10 @@ printf 'CLAUDE_PROXY_MODE=remote\n' >"$CLAUDE_PROXY_CONFIG"
 "$binary" start
 [[ $(head -n 1 "$CAPTURE") == -S ]]
 ! grep -q 'ControlMaster=yes' "$CAPTURE"
+grep -qx 'ObscureKeystrokeTiming=no' "$CAPTURE"
+grep -qx 'IgnoreUnknown=ObscureKeystrokeTiming' "$CAPTURE"
+SSH_OBSCURE_KEYSTROKE_TIMING=yes "$binary" start
+grep -qx 'ObscureKeystrokeTiming=yes' "$CAPTURE"
 SSH_COMPRESSION=no SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$binary" start
 grep -qx 'Compression=no' "$CAPTURE"
 grep -qx 'IPQoS=none' "$CAPTURE"
@@ -27,6 +31,11 @@ grep -qx 'ProxyUseFdpass=yes' "$CAPTURE"
 grep -q -- --http-connect "$CAPTURE"
 if SSH_HTTP_PROXY=http://user:password@127.0.0.1:1080 "$binary" start 2>/dev/null; then exit 1; fi
 if SSH_HTTP_PROXY=127.0.0.1:0 "$binary" start 2>/dev/null; then exit 1; fi
+REMOTE_API_PROXY=http://127.0.0.1:1085 REMOTE_API_NO_PROXY=internal.example "$binary" start
+! grep -q -- --http-connect "$CAPTURE"
+grep -q "http://127.0.0.1:1085" "$CAPTURE"
+if REMOTE_API_PROXY=http://user:password@127.0.0.1:1085 "$binary" start 2>/dev/null; then exit 1; fi
+if REMOTE_API_NO_PROXY=internal.example "$binary" start 2>/dev/null; then exit 1; fi
 [[ $(printf 'echo-test' | "$binary" --echo) == echo-test ]]
 env -u CLAUDE_PROXY_SOCKET HOME="$base" SSH_COMPRESSION=no "$binary" start
 socket1=$(sed -n '2p' "$CAPTURE")

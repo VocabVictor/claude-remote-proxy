@@ -197,8 +197,25 @@ std::string session_uuid(const fs::path& state) {
     close(fd);
     return id;
 }
+void validate_api_proxy(const std::string& proxy, const std::string& bypass) {
+    if (bypass.find_first_of("\r\n") != std::string::npos || bypass.find('\0') != std::string::npos)
+        throw std::runtime_error("invalid REMOTE_API_NO_PROXY");
+    if (proxy.empty()) {
+        if (!bypass.empty()) throw std::runtime_error("REMOTE_API_NO_PROXY requires REMOTE_API_PROXY");
+        return;
+    }
+    try {
+        if (proxy.rfind("http://", 0) != 0 || proxy.find('\0') != std::string::npos)
+            throw std::runtime_error("scheme");
+        proxy_address(proxy);
+    } catch (...) {
+        throw std::runtime_error("REMOTE_API_PROXY requires http://host:port without credentials or paths");
+    }
+}
 [[noreturn]] void serve(const std::string& project, const std::string& session,
-                       const std::string& binary, const std::string& permission) {
+                       const std::string& binary, const std::string& permission,
+                       const std::string& api_proxy = "", const std::string& api_bypass = "") {
+    validate_api_proxy(api_proxy, api_bypass);
     if (!fs::path(project).is_absolute() || !valid_session(session) || binary.empty() ||
         (permission != "standard" && permission != "bypass"))
         throw std::runtime_error("invalid remote arguments");
@@ -211,7 +228,23 @@ std::string session_uuid(const fs::path& state) {
         if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
             !(c >= '0' && c <= '9') && c != '-') c = '-';
     bool resume = fs::exists(fs::path(home()) / ".claude/projects" / key / (id + ".jsonl"));
-    std::string launch = "exec " + quote(binary);
+    std::string launch = "exec ";
+    if (!api_proxy.empty()) {
+        // Only the new Claude process and its children receive these values.
+        // Neither the SSH transport nor the shared tmux server is reconfigured.
+        std::string bypass = "localhost,127.0.0.1,::1";
+        if (!api_bypass.empty()) bypass += "," + api_bypass;
+        else for (auto name : {"NO_PROXY", "no_proxy"}) {
+            const char* inherited = std::getenv(name);
+            if (inherited && *inherited) bypass += "," + std::string(inherited);
+        }
+        launch += "env -u ALL_PROXY -u all_proxy";
+        for (auto name : {"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"})
+            launch += " " + quote(std::string(name) + "=" + api_proxy);
+        for (auto name : {"NO_PROXY", "no_proxy"}) launch += " " + quote(std::string(name) + "=" + bypass);
+        launch += " ";
+    }
+    launch += quote(binary);
     if (permission == "bypass") launch += " --dangerously-skip-permissions";
     launch += resume ? " --resume " : " --session-id ";
     launch += quote(id);
@@ -275,9 +308,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 6 && std::string(argv[1]) == "--serve")
             serve(argv[2], argv[3], argv[4], argv[5]);
+        if (argc == 8 && std::string(argv[1]) == "--serve")
+            serve(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
         std::string command = argc > 1 ? argv[1] : "start";
         if (command == "--version" || command == "version") {
-            std::cout << "claude-remote-proxy-native 0.4.0\n"; return 0;
+            std::cout << "claude-remote-proxy-native 0.5.0\n"; return 0;
         }
         if (command == "--help" || command == "help") {
             std::cout << "Usage: claude-remote-proxy-native [start|run|network-test|disconnect|version]\n"
@@ -306,8 +341,10 @@ int main(int argc, char** argv) {
         auto socket = get("CLAUDE_PROXY_SOCKET");
         auto ssh_config = get("CLAUDE_PROXY_SSH_CONFIG");
         auto compression = get("SSH_COMPRESSION"), qos = get("SSH_IP_QOS"), ciphers = get("SSH_CIPHERS");
-        auto obscure = get("SSH_OBSCURE_KEYSTROKE_TIMING");
+        auto obscure = get("SSH_OBSCURE_KEYSTROKE_TIMING", "no");
         auto proxy = get("SSH_HTTP_PROXY");
+        auto api_proxy = get("REMOTE_API_PROXY"), api_bypass = get("REMOTE_API_NO_PROXY");
+        validate_api_proxy(api_proxy, api_bypass);
         if (!proxy.empty()) proxy_address(proxy);
         if (!compression.empty() && compression != "yes" && compression != "no")
             throw std::runtime_error("SSH_COMPRESSION must be yes or no");
@@ -337,7 +374,7 @@ int main(int argc, char** argv) {
         if (!compression.empty()) args.insert(args.end(), {"-o", "Compression=" + compression});
         if (!qos.empty()) args.insert(args.end(), {"-o", "IPQoS=" + qos});
         if (!ciphers.empty()) args.insert(args.end(), {"-o", "Ciphers=" + ciphers});
-        if (!obscure.empty()) args.insert(args.end(), {"-o", "ObscureKeystrokeTiming=" + obscure});
+        if (!obscure.empty()) args.insert(args.end(), {"-o", "IgnoreUnknown=ObscureKeystrokeTiming", "-o", "ObscureKeystrokeTiming=" + obscure});
         if (command == "network-test") args.insert(args.end(), {"-o", "BatchMode=yes"});
         auto helper = get("REMOTE_PROXY_BIN");
         if (!fs::path(helper).is_absolute()) throw std::runtime_error("REMOTE_PROXY_BIN must be an absolute remote path");
@@ -351,6 +388,8 @@ int main(int argc, char** argv) {
                      "-o", "ConnectTimeout=10", command == "network-test" ? "-T" : "-tt", target});
         args.push_back("exec " + quote(helper) + (command == "network-test" ? " --echo" :
                      " --serve " + quote(project) + " " + quote(session) + " " + quote(binary) + " " + quote(permission)));
+        if (command != "network-test" && !api_proxy.empty())
+            args.back() += " " + quote(api_proxy) + " " + quote(api_bypass);
         if (command == "network-test") return network_test(args);
         execute(args);
     } catch (const std::exception& error) {
