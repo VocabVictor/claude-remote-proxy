@@ -10,11 +10,24 @@ printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE"\n' >"$base/bin/ssh"
 cp "$base/bin/ssh" "$base/bin/tmux"
 chmod +x "$base/bin/ssh" "$base/bin/tmux"
 export SSH_TARGET=test REMOTE_PROJECT_DIR="$base/project with ' quote" REMOTE_PROXY_BIN="$binary"
+export CLAUDE_PROXY_SOCKET="$base/control.sock"
 export CLAUDE_PROXY_CONFIG="$base/config"
 printf 'CLAUDE_PROXY_MODE=remote\n' >"$CLAUDE_PROXY_CONFIG"
 "$binary" start
 [[ $(head -n 1 "$CAPTURE") == -S ]]
 ! grep -q 'ControlMaster=yes' "$CAPTURE"
+SSH_COMPRESSION=no SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$binary" start
+grep -qx 'Compression=no' "$CAPTURE"
+grep -qx 'IPQoS=none' "$CAPTURE"
+grep -qx 'Ciphers=aes128-gcm@openssh.com' "$CAPTURE"
+grep -qx 'ObscureKeystrokeTiming=no' "$CAPTURE"
+if SSH_COMPRESSION=invalid "$binary" start 2>/dev/null; then exit 1; fi
+[[ $(printf 'echo-test' | "$binary" --echo) == echo-test ]]
+env -u CLAUDE_PROXY_SOCKET HOME="$base" SSH_COMPRESSION=no "$binary" start
+socket1=$(sed -n '2p' "$CAPTURE")
+env -u CLAUDE_PROXY_SOCKET HOME="$base" SSH_COMPRESSION=yes "$binary" start
+socket2=$(sed -n '2p' "$CAPTURE")
+[[ $socket1 == *%C* && $socket1 != "$socket2" ]]
 "$binary" --serve "$REMOTE_PROJECT_DIR" test-session "$base/claude with ' quote" standard
 state="$HOME/.claude/remote-proxy/test-session.session-id"
 id=$(cat "$state")

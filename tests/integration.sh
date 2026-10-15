@@ -73,6 +73,11 @@ for ((i=0;i<100;i++)); do
   [[ -e $base/sshd.pid ]] && break
   sleep .05
 done
+env -u CLAUDE_PROXY_SOCKET "$REMOTE_PROXY_BIN" network-test
+env -u CLAUDE_PROXY_SOCKET "$REMOTE_PROXY_BIN" disconnect
+env -u CLAUDE_PROXY_SOCKET SSH_COMPRESSION=yes SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$REMOTE_PROXY_BIN" network-test
+env -u CLAUDE_PROXY_SOCKET SSH_COMPRESSION=yes SSH_IP_QOS=none SSH_CIPHERS=aes128-gcm@openssh.com SSH_OBSCURE_KEYSTROKE_TIMING=no "$REMOTE_PROXY_BIN" disconnect
+"$REMOTE_PROXY_BIN" network-test
 "$base/terminal" --drop "$REMOTE_PROXY_BIN" start
 read -r pid flag id <"$base/events"
 [[ $flag == --session-id ]]

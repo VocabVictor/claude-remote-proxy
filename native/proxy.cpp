@@ -1,5 +1,8 @@
 // Linux/WSL client and remote helper. OpenSSH owns transport and terminal I/O.
 #include <cerrno>
+#include <algorithm>
+#include <chrono>
+#include <csignal>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +21,8 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <poll.h>
 #include <unistd.h>
 
 namespace fs = std::filesystem;
@@ -61,20 +66,81 @@ std::string hash(const std::string& text) {
     return result.str();
 }
 void private_directory(const fs::path& path) {
-    fs::create_directories(path);
     struct stat st{};
-    if (lstat(path.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid())
+    if (lstat(path.c_str(), &st)) {
+        if (errno != ENOENT) throw std::runtime_error("cannot inspect state directory");
+        fs::create_directories(path);
+        if (lstat(path.c_str(), &st)) throw std::runtime_error("cannot inspect new state directory");
+    }
+    if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid())
         throw std::runtime_error("unsafe state directory: " + path.string());
     if ((st.st_mode & 077) && chmod(path.c_str(), 0700))
         throw std::runtime_error("cannot restrict state directory");
 }
-std::string read_uuid(const fs::path& state) {
-    std::ifstream in(state);
-    if (!in) {
-        if (fs::exists(state)) throw std::runtime_error("cannot read session state");
-        return {};
+// Diagnostic only. Normal interactive sessions still exec SSH without a relay.
+int network_test(const Strings& args) {
+    int input[2], output[2];
+    if (pipe2(input, O_CLOEXEC)) throw std::runtime_error("probe pipe failed");
+    if (pipe2(output, O_CLOEXEC)) { close(input[0]); close(input[1]); throw std::runtime_error("probe pipe failed"); }
+    auto start = std::chrono::steady_clock::now();
+    pid_t child = fork();
+    if (child < 0) throw std::runtime_error("probe fork failed");
+    if (!child) {
+        if (dup2(input[0], STDIN_FILENO) < 0 || dup2(output[1], STDOUT_FILENO) < 0) _exit(126);
+        try { execute(args); } catch (...) { _exit(127); }
     }
-    std::string id; std::getline(in, id);
+    close(input[0]); close(output[1]);
+    auto previous = std::signal(SIGPIPE, SIG_IGN);
+    std::vector<double> samples;
+    double first = 0;
+    bool ok = true;
+    for (int i = 0; i < 51; ++i) {
+        auto sent = std::chrono::steady_clock::now();
+        unsigned char value = static_cast<unsigned char>(i + 32), response = 0;
+        ssize_t wrote;
+        do { wrote = write(input[1], &value, 1); } while (wrote < 0 && errno == EINTR);
+        pollfd descriptor{output[0], POLLIN, 0};
+        int ready;
+        do { ready = poll(&descriptor, 1, 15000); } while (ready < 0 && errno == EINTR);
+        ssize_t got = -1;
+        if (ready > 0) do { got = read(output[0], &response, 1); } while (got < 0 && errno == EINTR);
+        if (wrote != 1 || got != 1 || response != value) { ok = false; break; }
+        auto now = std::chrono::steady_clock::now();
+        if (!i) first = std::chrono::duration<double, std::milli>(now - start).count();
+        else samples.push_back(std::chrono::duration<double, std::milli>(now - sent).count());
+    }
+    close(input[1]); close(output[0]);
+    if (!ok) kill(child, SIGTERM);
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    std::signal(SIGPIPE, previous);
+    if (!ok || !WIFEXITED(status) || WEXITSTATUS(status)) throw std::runtime_error("SSH echo probe failed (timeout, banner, or remote helper error)");
+    std::sort(samples.begin(), samples.end());
+    std::cout << "SSH echo: samples=50 first_response_ms=" << first
+              << " p50_rtt_ms=" << (samples[24] + samples[25]) / 2
+              << " p95_rtt_ms=" << samples[47] << " max_rtt_ms=" << samples.back()
+              << " (no Claude/model calls; excludes tmux/rendering)\n";
+    return 0;
+}
+std::string read_uuid(const fs::path& state) {
+    int fd = open(state.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        // Do not perform a second existence check: another initializer may
+        // atomically publish the file between open(ENOENT) and that check.
+        if (errno == ENOENT) return {};
+        throw std::runtime_error("cannot read session state");
+    }
+    char buffer[38]; size_t size = 0;
+    while (size < sizeof buffer) {
+        ssize_t n = read(fd, buffer + size, sizeof buffer - size);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) { close(fd); throw std::runtime_error("cannot read session state"); }
+        if (!n) break;
+        size += static_cast<size_t>(n);
+    }
+    close(fd);
+    if (size == 37 && buffer[36] == '\n') --size;
+    std::string id(buffer, size);
     if (!valid_uuid(id)) throw std::runtime_error("invalid session UUID: " + state.string());
     return id;
 }
@@ -179,19 +245,34 @@ std::map<std::string, std::string> config() {
 }
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--echo") {
+            char buffer[4096];
+            for (;;) {
+                ssize_t n = read(STDIN_FILENO, buffer, sizeof buffer);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) throw std::runtime_error("echo read failed");
+                if (!n) return 0;
+                for (ssize_t offset = 0; offset < n;) {
+                    ssize_t wrote = write(STDOUT_FILENO, buffer + offset, n - offset);
+                    if (wrote < 0 && errno == EINTR) continue;
+                    if (wrote <= 0) throw std::runtime_error("echo write failed");
+                    offset += wrote;
+                }
+            }
+        }
         if (argc == 6 && std::string(argv[1]) == "--serve")
             serve(argv[2], argv[3], argv[4], argv[5]);
         std::string command = argc > 1 ? argv[1] : "start";
         if (command == "--version" || command == "version") {
-            std::cout << "claude-remote-proxy-native 0.3.0\n"; return 0;
+            std::cout << "claude-remote-proxy-native 0.3.1\n"; return 0;
         }
         if (command == "--help" || command == "help") {
-            std::cout << "Usage: claude-remote-proxy-native [start|run|disconnect|version]\n"
+            std::cout << "Usage: claude-remote-proxy-native [start|run|network-test|disconnect|version]\n"
                          "Remote mode only. Configure SSH_TARGET, REMOTE_PROJECT_DIR, "
                          "REMOTE_PROXY_BIN (absolute remote helper path).\n";
             return 0;
         }
-        if (argc > 2 || (command != "start" && command != "run" && command != "disconnect"))
+        if (argc > 2 || (command != "start" && command != "run" && command != "disconnect" && command != "network-test"))
             throw std::runtime_error("unsupported command; use --help");
         auto values = config();
         auto get = [&](const std::string& name, std::string fallback = "") {
@@ -205,22 +286,37 @@ int main(int argc, char** argv) {
             !fs::path(project).is_absolute()) throw std::runtime_error("invalid SSH_TARGET or REMOTE_PROJECT_DIR");
         auto mode = get("CLAUDE_PROXY_MODE", "remote");
         if (mode != "remote") throw std::runtime_error("native client only supports remote mode");
-        auto session = get("REMOTE_TMUX_SESSION", "claude-native-" + hash(project));
+        auto session = get("REMOTE_TMUX_SESSION");
+        if (session.empty()) session = "claude-native-" + hash(project);
         if (!valid_session(session)) throw std::runtime_error("invalid tmux session name");
         auto socket_dir = fs::path(home()) / ".cache/claude-remote-proxy";
         auto socket = get("CLAUDE_PROXY_SOCKET");
+        auto ssh_config = get("CLAUDE_PROXY_SSH_CONFIG");
+        auto compression = get("SSH_COMPRESSION"), qos = get("SSH_IP_QOS"), ciphers = get("SSH_CIPHERS");
+        auto obscure = get("SSH_OBSCURE_KEYSTROKE_TIMING");
+        if (!compression.empty() && compression != "yes" && compression != "no")
+            throw std::runtime_error("SSH_COMPRESSION must be yes or no");
+        if (!obscure.empty() && obscure != "yes" && obscure != "no")
+            throw std::runtime_error("SSH_OBSCURE_KEYSTROKE_TIMING must be yes or no");
         if (socket.empty()) {
             private_directory(socket_dir);
-            socket = (socket_dir / hash(target + "\n" + get("REMOTE_USER"))).string();
+            // OpenSSH expands %C using resolved host, port, user and jump host.
+            // Profile-specific masters prevent a new option silently reusing old settings.
+            socket = (socket_dir / ("%C-" + hash(ssh_config + "\n" + compression + "\n" + qos + "\n" + ciphers + "\n" + obscure).substr(0, 8))).string();
+            if (socket.size() + 38 > 100) throw std::runtime_error("expanded SSH socket path too long; set CLAUDE_PROXY_SOCKET");
         }
         if (socket.size() > 100) throw std::runtime_error("SSH control socket path too long; set CLAUDE_PROXY_SOCKET");
         Strings args{"ssh"};
-        auto ssh_config = get("CLAUDE_PROXY_SSH_CONFIG");
         if (!ssh_config.empty()) { args.push_back("-F"); args.push_back(ssh_config); }
         args.insert(args.end(), {"-S", socket});
         auto user = get("REMOTE_USER");
         if (!user.empty()) { args.push_back("-l"); args.push_back(user); }
         if (command == "disconnect") { args.insert(args.end(), {"-O", "exit", target}); execute(args); }
+        if (!compression.empty()) args.insert(args.end(), {"-o", "Compression=" + compression});
+        if (!qos.empty()) args.insert(args.end(), {"-o", "IPQoS=" + qos});
+        if (!ciphers.empty()) args.insert(args.end(), {"-o", "Ciphers=" + ciphers});
+        if (!obscure.empty()) args.insert(args.end(), {"-o", "ObscureKeystrokeTiming=" + obscure});
+        if (command == "network-test") args.insert(args.end(), {"-o", "BatchMode=yes"});
         auto helper = get("REMOTE_PROXY_BIN");
         if (!fs::path(helper).is_absolute()) throw std::runtime_error("REMOTE_PROXY_BIN must be an absolute remote path");
         auto binary = get("REMOTE_CLAUDE_BIN", "claude");
@@ -230,9 +326,10 @@ int main(int argc, char** argv) {
         // hashing commands, shell launcher or intermediate relay loop.
         args.insert(args.end(), {"-o", "ControlMaster=auto", "-o", "ControlPersist=" + get("SSH_CONTROL_PERSIST", "8h"),
                      "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-                     "-o", "ConnectTimeout=10", "-tt", target,
-                     "exec " + quote(helper) + " --serve " + quote(project) + " " + quote(session) +
-                     " " + quote(binary) + " " + quote(permission)});
+                     "-o", "ConnectTimeout=10", command == "network-test" ? "-T" : "-tt", target});
+        args.push_back("exec " + quote(helper) + (command == "network-test" ? " --echo" :
+                     " --serve " + quote(project) + " " + quote(session) + " " + quote(binary) + " " + quote(permission)));
+        if (command == "network-test") return network_test(args);
         execute(args);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n'; return 1;

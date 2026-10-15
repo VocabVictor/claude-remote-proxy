@@ -53,6 +53,10 @@ values. Set `REMOTE_TMUX_SESSION` explicitly to reuse a Bash client's session;
 the native default uses a different in-process hash. `CLAUDE_PROXY_SSH_CONFIG`
 optionally selects an SSH config file. Run `disconnect` to close the master.
 
+Network tuning and measurement are documented in [performance notes](docs/performance.md).
+`native/claude-remote-proxy-native network-test` measures 50 request/reply
+round trips through authenticated SSH, without starting Claude or tmux.
+
 Measured on the owner's Singapore Tencent instance (2026-10-15, Ubuntu 26.04,
 2 vCPU / 2 GB), using real loopback SSH and tmux with an already running test
 process, 20 measured warm attachments per client after one discarded warm-up:
