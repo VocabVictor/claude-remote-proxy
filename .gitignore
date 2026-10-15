@@ -2,3 +2,9 @@
 .DS_Store
 *.sock
 native/claude-remote-proxy-native
+native/claude-remote-proxy-edge
+/.secrets/
+/edge/.wrangler/
+/edge/dist/
+/.wrangler/
+/dist/

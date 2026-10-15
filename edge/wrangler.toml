@@ -1,0 +1,11 @@
+name = "ccproxy-edge-20261015"
+main = "worker.mjs"
+compatibility_date = "2026-10-15"
+workers_dev = true
+preview_urls = false
+send_metrics = false
+routes = [{ pattern = "ccproxy-edge.34920208.xyz", custom_domain = true }]
+
+[observability]
+enabled = false
+

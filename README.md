@@ -57,6 +57,8 @@ the native default uses a different in-process hash. `CLAUDE_PROXY_SSH_CONFIG`
 optionally selects an SSH config file. Run `disconnect` to close the master.
 
 Network tuning and measurement are documented in [performance notes](docs/performance.md).
+The [Cloudflare experiment](edge/README.md) records direct, proxy-disabled
+measurements; its slower/unstable path was not enabled for SSH.
 `native/claude-remote-proxy-native network-test` measures 50 request/reply
 round trips through authenticated SSH, without starting Claude or tmux.
 If measured faster, set `SSH_HTTP_PROXY=http://127.0.0.1:1080` to use a local
