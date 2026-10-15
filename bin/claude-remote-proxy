@@ -30,6 +30,7 @@ Commands:
 
 Configuration is loaded from .claude-remote-proxy.env in the project root.
 Copy examples/proxy.env.example from this repository to get started.
+Set CLAUDE_PROXY_MODE=remote for existing server projects (no file upload).
 EOF
 }
 
@@ -75,6 +76,7 @@ CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}"
 CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-standard}"
 SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-8h}"
+CLAUDE_PROXY_MODE="${CLAUDE_PROXY_MODE:-import}"
 
 target_hash() {
   printf '%s' "$SSH_TARGET" | shasum | cut -c1-12
@@ -92,6 +94,10 @@ configure() {
   case "$CLAUDE_PERMISSION_MODE" in
     standard|bypass) ;;
     *) die "CLAUDE_PERMISSION_MODE must be 'standard' or 'bypass'" ;;
+  esac
+  case "$CLAUDE_PROXY_MODE" in
+    import|remote) ;;
+    *) die "CLAUDE_PROXY_MODE must be 'import' or 'remote'" ;;
   esac
   REMOTE_TMUX_SESSION="${REMOTE_TMUX_SESSION:-claude-proxy-$(printf '%s' "$REMOTE_PROJECT_DIR" | shasum | cut -c1-12)}"
   validate_safe_token REMOTE_TMUX_SESSION "$REMOTE_TMUX_SESSION"
@@ -130,7 +136,56 @@ remote_as_user() {
   local inner=$1 user_q inner_q
   user_q=$(single_quote "$REMOTE_USER")
   inner_q=$(single_quote "$inner")
-  remote_root "su - $user_q -c $inner_q"
+  remote_root "if [ \"\$(id -un)\" = $user_q ]; then exec bash -lc $inner_q; else exec su - $user_q -c $inner_q; fi"
+}
+
+# The project already lives on the server. Do all preparation in one SSH
+# channel: no local session import, rsync, recursive chown, or status probes.
+run_remote_project() {
+  connect_master
+  local script user_q script_q
+  script="$(cat <<'REMOTE'
+set -euo pipefail
+cd "$project"
+command -v tmux >/dev/null
+command -v claude >/dev/null
+command -v flock >/dev/null
+state_dir="$HOME/.claude/remote-proxy"
+mkdir -p "$state_dir"
+chmod 700 "$state_dir"
+state="$state_dir/$session.session-id"
+exec 9>"$state.lock"
+flock -x 9
+if [[ -s $state ]]; then
+  uuid=$(cat "$state")
+else
+  uuid=$(cat /proc/sys/kernel/random/uuid)
+  (umask 077; printf '%s\n' "$uuid" > "$state")
+fi
+[[ $uuid =~ ^[0-9A-Fa-f-]{36}$ ]] || exit 1
+key=$(LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g' <<< "$project")
+args=(claude)
+[[ $permission != bypass ]] || args+=(--dangerously-skip-permissions)
+if [[ -f "$HOME/.claude/projects/$key/$uuid.jsonl" ]]; then
+  args+=(--resume "$uuid")
+else
+  args+=(--session-id "$uuid")
+fi
+printf -v launch '%q ' "${args[@]}"
+flock -u 9
+exec 9>&-
+# -A attaches if it exists, otherwise creates it atomically in tmux.
+exec tmux new-session -A -s "$session" -c "$project" "$launch"
+REMOTE
+)"
+  script="project=$(single_quote "$REMOTE_PROJECT_DIR")
+session=$(single_quote "$REMOTE_TMUX_SESSION")
+permission=$(single_quote "$CLAUDE_PERMISSION_MODE")
+$script"
+  user_q=$(single_quote "$REMOTE_USER")
+  script_q=$(single_quote "$script")
+  exec ssh -tt -S "$CONTROL_SOCKET" "$SSH_TARGET" \
+    "if [ \"\$(id -un)\" = $user_q ]; then exec bash -lc $script_q; else exec su - $user_q -s /bin/bash -c $script_q; fi"
 }
 
 remote_home() {
@@ -334,9 +389,16 @@ main() {
   case "$command" in
     connect) connect_master ;;
     status) status ;;
-    sync) sync_all ;;
-    run) run_remote ;;
+    sync)
+      [[ $CLAUDE_PROXY_MODE != remote ]] || die "sync is disabled in remote mode; the server owns the workspace"
+      sync_all ;;
+    run)
+      if [[ $CLAUDE_PROXY_MODE == remote ]]; then run_remote_project; else run_remote; fi ;;
     start)
+      if [[ $CLAUDE_PROXY_MODE == remote ]]; then
+        run_remote_project
+        return
+      fi
       status
       if remote_session_is_initialized; then
         log "remote session already exists; skipping workspace and context sync"

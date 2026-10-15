@@ -1,5 +1,33 @@
 # Claude Remote Proxy
 
+## Existing remote projects (this fork)
+
+For projects already on a company server, set `CLAUDE_PROXY_MODE="remote"`
+in your local `.claude-remote-proxy.env`, together with `SSH_TARGET`,
+`REMOTE_USER`, and `REMOTE_PROJECT_DIR`. Set `REMOTE_USER` to your SSH login
+user when possible; root and `su` are then unnecessary.
+
+Run `claude-remote-proxy start` to create or attach to a persistent remote
+Claude Code terminal. This mode never uploads files or local sessions, never
+changes workspace ownership, and refuses the `sync` command. A fresh remote
+conversation is assigned a stable UUID; later process restarts resume it.
+The remote project directory must already exist. Linux, Bash, `flock`, tmux,
+and authenticated Claude Code are required on the remote host.
+
+The warm start uses one SSH control check and one interactive SSH channel.
+Preparation happens in that channel, avoiding repeated network round trips.
+`tmux new-session -A` creates or attaches without a check/create race.
+Concurrent starts serialize UUID initialization with `flock`.
+
+The default mode remains `import` for compatibility. SSH disconnection leaves
+tmux running; run `start` again to reconnect. This is not automatic reconnect,
+Mosh predictive echo, a model API proxy, or a file synchronization service.
+Any process-scoped network proxy for Claude must be configured separately on
+the remote host. This tool does not change the server's network settings.
+
+On Windows use WSL with the repository in the Linux filesystem where possible.
+Shell files are checked out as LF through `.gitattributes`.
+
 Run Claude Code on a remote machine while keeping its terminal fully visible
 and interactive on your local machine.
 
