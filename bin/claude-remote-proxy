@@ -77,6 +77,7 @@ CLAUDE_SESSION_ID="${CLAUDE_SESSION_ID:-}"
 CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-standard}"
 SSH_CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-8h}"
 CLAUDE_PROXY_MODE="${CLAUDE_PROXY_MODE:-import}"
+REMOTE_CLAUDE_BIN="${REMOTE_CLAUDE_BIN:-claude}"
 
 target_hash() {
   printf '%s' "$SSH_TARGET" | shasum | cut -c1-12
@@ -99,6 +100,7 @@ configure() {
     import|remote) ;;
     *) die "CLAUDE_PROXY_MODE must be 'import' or 'remote'" ;;
   esac
+  [[ -n $REMOTE_CLAUDE_BIN ]] || die "REMOTE_CLAUDE_BIN must not be empty"
   REMOTE_TMUX_SESSION="${REMOTE_TMUX_SESSION:-claude-proxy-$(printf '%s' "$REMOTE_PROJECT_DIR" | shasum | cut -c1-12)}"
   validate_safe_token REMOTE_TMUX_SESSION "$REMOTE_TMUX_SESSION"
   CONTROL_SOCKET="${CLAUDE_PROXY_SOCKET:-/tmp/claude-proxy-${UID}-$(target_hash).sock}"
@@ -148,7 +150,7 @@ run_remote_project() {
 set -euo pipefail
 cd "$project"
 command -v tmux >/dev/null
-command -v claude >/dev/null
+command -v "$claude_bin" >/dev/null
 command -v flock >/dev/null
 state_dir="$HOME/.claude/remote-proxy"
 mkdir -p "$state_dir"
@@ -164,7 +166,7 @@ else
 fi
 [[ $uuid =~ ^[0-9A-Fa-f-]{36}$ ]] || exit 1
 key=$(LC_ALL=C sed 's/[^A-Za-z0-9-]/-/g' <<< "$project")
-args=(claude)
+args=("$claude_bin")
 [[ $permission != bypass ]] || args+=(--dangerously-skip-permissions)
 if [[ -f "$HOME/.claude/projects/$key/$uuid.jsonl" ]]; then
   args+=(--resume "$uuid")
@@ -181,6 +183,7 @@ REMOTE
   script="project=$(single_quote "$REMOTE_PROJECT_DIR")
 session=$(single_quote "$REMOTE_TMUX_SESSION")
 permission=$(single_quote "$CLAUDE_PERMISSION_MODE")
+claude_bin=$(single_quote "$REMOTE_CLAUDE_BIN")
 $script"
   user_q=$(single_quote "$REMOTE_USER")
   script_q=$(single_quote "$script")

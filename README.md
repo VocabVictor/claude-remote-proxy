@@ -25,6 +25,25 @@ Mosh predictive echo, a model API proxy, or a file synchronization service.
 Any process-scoped network proxy for Claude must be configured separately on
 the remote host. This tool does not change the server's network settings.
 
+Set `REMOTE_CLAUDE_BIN` to an absolute executable path when Claude is not on
+the remote login shell's PATH.
+
+### Validation
+
+Run `bash tests/test.sh` and `bash tests/remote.sh` for local regression tests.
+On a disposable Linux server with SSH server, tmux, flock, Python 3 and shasum,
+run `sudo python3 tests/integration.py`. It starts a separate SSH daemon bound
+only to loopback with temporary host/client keys and strict host verification.
+It checks initial launch, process survival after a disconnected client,
+reattachment without a duplicate process, and restart with the original UUID.
+The Claude executable is a deterministic test stand-in: no authentication or
+model calls are performed. Test processes, keys, workspace and session state
+are cleaned up; the system SSH configuration is not changed.
+
+This integration test passed on the owner's Tencent Cloud Singapore instance
+(Ubuntu Server 26.04, 2 vCPU / 2 GB). This validates SSH/tmux session lifecycle,
+not Claude subscription authentication, model latency, or company networking.
+
 On Windows use WSL with the repository in the Linux filesystem where possible.
 Shell files are checked out as LF through `.gitattributes`.
 
