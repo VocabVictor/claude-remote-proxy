@@ -1,5 +1,12 @@
 # Cloudflare edge experiment (not an enabled SSH transport)
 
+**2026-10-16 follow-up:** broader IP selection plus a self-hosted native
+wstunnel origin completed authenticated, end-to-end SSH echo tests without
+a local proxy listener. Some paths improved substantially; results vary by
+client and IP. See [measurements and an optional SSH profile](wstunnel-results.md).
+The sections below describe the initial Worker-only experiment, not a limit
+on all Cloudflare routes. The Worker itself remains probe-only.
+
 The owner's Cloudflare Free account was tested on 2026-10-15 with Wrangler
 4.108.0. A new authenticated probe-only Worker is deployed at
 `https://ccproxy-edge.34920208.xyz`. No paid plan, Spectrum, Argo, WARP,

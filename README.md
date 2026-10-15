@@ -58,7 +58,9 @@ optionally selects an SSH config file. Run `disconnect` to close the master.
 
 Network tuning and measurement are documented in [performance notes](docs/performance.md).
 The [Cloudflare experiment](edge/README.md) records direct, proxy-disabled
-measurements; its slower/unstable path was not enabled for SSH.
+measurements. A [follow-up with IP selection and wstunnel](edge/wstunnel-results.md)
+completed real SSH echo tests and reduced tail latency on some routes; it is
+an optional transport experiment, not an automatically enabled route.
 `native/claude-remote-proxy-native network-test` measures 50 request/reply
 round trips through authenticated SSH, without starting Claude or tmux.
 If measured faster, set `SSH_HTTP_PROXY=http://127.0.0.1:1080` to use a local
